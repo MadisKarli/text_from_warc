@@ -1,5 +1,5 @@
 .project
 .vagrant
-.idea
-/lib
-/target
+.idea/
+lib/
+target/
