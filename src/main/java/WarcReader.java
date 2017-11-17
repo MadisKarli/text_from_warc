@@ -8,6 +8,7 @@ import org.apache.hadoop.hbase.TableName;
 import org.apache.hadoop.hbase.client.*;
 import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.hadoop.io.LongWritable;
+import org.apache.hadoop.io.SequenceFile;
 import org.apache.hadoop.io.Text;
 import org.apache.hadoop.mapreduce.lib.output.TextOutputFormat;
 import org.apache.log4j.LogManager;
@@ -36,9 +37,15 @@ import org.xml.sax.SAXException;
 import scala.Tuple2;
 
 import java.io.*;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.List;
+import java.util.*;
+
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.FileSystem;
+import org.apache.hadoop.io.SequenceFile;
+import org.apache.hadoop.io.SequenceFile.Writer;
+import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.io.Text;
+
 
 /**
  * Created by Madis-Karli Koppel on 3/11/2017.
@@ -66,6 +73,9 @@ public class WarcReader {
     }
 
     private static void sparkWarcReader(String inputPath, final String outputPath) {
+
+        final String htmlError = "ERROR: html document should be handled elsewhere";
+
         // Initialise Spark
         SparkConf sparkConf = new SparkConf().setAppName("Spark PDF text extraction");
         JavaSparkContext sc = new JavaSparkContext(sparkConf);
@@ -79,6 +89,8 @@ public class WarcReader {
 
 
         // TODO maybe combine url and date?
+        // Here we create JavaRDD<Row> because they are the easiest to save into hbase
+        // If hbase is not used then we could change it to any other JavaRDD
         JavaRDD<Row> records = warcRecords
                 // TODO filter HTML out
                 .filter(new Function<Tuple2<LongWritable, WarcRecord>, Boolean>() {
@@ -103,6 +115,7 @@ public class WarcReader {
                     public Row call(Tuple2<LongWritable, WarcRecord> s) throws IOException {
                         String exceptionMessage = "";
                         String exceptionCause = "";
+                        String contentType = "";
                         logger.debug("reading " + s._1);
 
                         String id = s._2.getHeader("WARC-Target-URI").value;
@@ -115,58 +128,91 @@ public class WarcReader {
                             Metadata metadata = new Metadata();
 
                             parser.parse(s._2.getPayload().getInputStream(), handler, metadata);
-
-                            // TODO can this be done in filter?
-                            // Ignore html files as they are handled in another part of the pipeline
-                            if(metadata.get("Content-Type").contains("text/html")){
-                                logger.debug("IGNORE HTML " + id);
-                                return RowFactory.create(id, "ERROR: html document should be handled elsewhere");
-                            }
-
-                        // Test if we can recreate the file
-                            byte[] buffer = new byte[s._2.getPayload().getInputStream().available()];
-                            s._2.getPayload().getInputStream().read(buffer);
-
-                            File targetFile = new File(outputPath +"/"+ System.currentTimeMillis());
-                            OutputStream outStream = new FileOutputStream(targetFile);
-                            outStream.write(buffer);
-//                            byte data[] = s._2.getPayload().getInputStream();
-//                            FileOutputStream out = new FileOutputStream(outputPath +"/"+ System.currentTimeMillis());
-//                            out.write(bytes);
-//                            out.close();
+                            contentType = metadata.get("Content-Type");
+//                            if(contentType.contains("text/html")){
+//
+//                            }
 
                             logger.debug("finished " + s._1);
-                            return RowFactory.create(id, handler.toString());
+                            return RowFactory.create(id, contentType, handler.toString());
 
                         } catch (TikaException e) {
-                            // e.printStackTrace();
                             exceptionMessage = e.getMessage();
                             exceptionCause = e.getCause().toString();
                             logger.error(e.getMessage() + " when parsing " + id + " cause " + exceptionCause);
                         } catch (SAXException e) {
-                            // e.printStackTrace();
                             exceptionMessage = e.getMessage();
                             exceptionCause = e.getException().toString();
                             logger.error(e.getMessage() + " when parsing " + id + " cause " + exceptionCause);
                         }
 
-                        return RowFactory.create(id, "ERROR: " + exceptionMessage + ":" + exceptionCause + " | " + Arrays.asList(s._2.getHeaderList()));
+                        return RowFactory.create(id, contentType, "ERROR: " + exceptionMessage + ":" + exceptionCause + " | " + Arrays.asList(s._2.getHeaderList()));
                     }
                 });
 
-        // output.saveAsNewAPIHadoopFile(outputPath, Text.class, Text.class, org.apache.hadoop.mapred.TextOutputFormat.class, hadoopconf);
+        JavaRDD<Row> html = records.filter(new Function<Row, Boolean>() {
+            public Boolean call(Row row) throws Exception {
+                if(row.getString(1).contains("text/html")){
+                    return true;
+                }
+                if(row.getString(1).contains("application/xhtml+xml")){
+                    return true;
+                }
+                return false;
+            }
+        });
 
+        JavaRDD<Row> plaintext = records.filter(new Function<Row, Boolean>() {
+            public Boolean call(Row row) throws Exception {
+                if(row.getString(1).contains("text/plain")){
+                    return true;
+                }
+                return false;
+            }
+        });
+
+        JavaRDD<Row> others = records.filter(new Function<Row, Boolean>() {
+            public Boolean call(Row row) throws Exception {
+                if(row.getString(1).contains("text/plain")){
+                    return false;
+                }
+                if(row.getString(1).contains("text/html")){
+                    return false;
+                }
+                if(row.getString(1).contains("application/xhtml+xml")){
+                    return false;
+                }
+                return true;
+            }
+        });
+
+        JavaPairRDD<Text, Text> htmlRDD = html.mapToPair(new PairFunction<Row, Text, Text>() {
+            public Tuple2<Text, Text> call(Row row) throws Exception {
+                return new Tuple2<Text, Text>(new Text(row.getString(0)), new Text(row.getString(2)));
+            }
+        });
+
+        htmlRDD.saveAsNewAPIHadoopFile(outputPath + "/html", Text.class, Text.class, org.apache.hadoop.mapreduce.lib.output.SequenceFileOutputFormat.class, hadoopconf);
+
+        //saveDF(html, sqlContext, outputPath, "html");
+        //saveDF(plaintext, sqlContext, outputPath, "plaintext");
+        //saveDF(others, sqlContext, outputPath, "others");
+
+        sc.close();
+    }
+
+    private static void saveDF(JavaRDD<Row> javaRDD,  SQLContext sqlContext, String outputPath, String dirName) {
         List<StructField> fields = new ArrayList<StructField>();
         fields.add(DataTypes.createStructField("id", DataTypes.StringType, true));
+        fields.add(DataTypes.createStructField("contentType", DataTypes.StringType, true));
         fields.add(DataTypes.createStructField("content", DataTypes.StringType, true));
         StructType schema = DataTypes.createStructType(fields);
 
-        DataFrame df = sqlContext.createDataFrame(records, schema);
+        DataFrame df = sqlContext.createDataFrame(javaRDD, schema);
 
         // records.collect();
-        df.write().json(outputPath);
+        df.write().json(outputPath + "/" + dirName);
 
-        sc.close();
     }
 
     public static void readHbase() throws IOException {
