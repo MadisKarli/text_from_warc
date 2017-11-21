@@ -60,9 +60,13 @@ public class WarcReader {
         // TODO remove before prod
         String outputPath = args[1] + System.currentTimeMillis();
 
+        long start = System.currentTimeMillis();
+        logger.info("Starting spark...");
         sparkWarcReader(inputPath, outputPath);
+        logger.info("Spark Finished...");
+        long end = System.currentTimeMillis();
+        logger.error("Total time taken " + (end-start));
 
-        //logger.warn("Starting up...");
         //readHbase();
 
     }
@@ -83,27 +87,21 @@ public class WarcReader {
 
         // Here we create JavaRDD<Row> because they are the easiest to save into hbase
         // If hbase is not used then we could change it to other JavaPairRDD that is easiest to save as sequence file
-        JavaRDD<Row> records = warcRecords
+        JavaPairRDD<Text, Tuple2<Text, Text>> records2 = warcRecords
                 .filter(new Function<Tuple2<LongWritable, WarcRecord>, Boolean>() {
-                    public Boolean call(Tuple2<LongWritable, WarcRecord> s) {
-
+                    public Boolean call(Tuple2<LongWritable, WarcRecord> s) throws Exception {
                         String header = s._2.getHeader("Content-Type").value;
 
-                        if (header.equals("application/warc-fields")) {
-                            // Ignore WARC file information
-                            return false;
-                        }
+                        // Ignore WARC file information
+                        if (header.equals("application/warc-fields")) return false;
 
-                        if (header.equals("text/dns")) {
-                            // Nothing interesting in DNS files
-                            return false;
-                        }
+                        // Nothing interesting in DNS files
+                        if (header.equals("text/dns")) return false;
 
                         return true;
                     }
-                })
-                .map(new Function<Tuple2<LongWritable, WarcRecord>, Row>() {
-                    public Row call(Tuple2<LongWritable, WarcRecord> s) throws IOException {
+                }).mapToPair(new PairFunction<Tuple2<LongWritable, WarcRecord>, Text, Tuple2<Text, Text>>() {
+                    public Tuple2<Text, Tuple2<Text, Text>> call(Tuple2<LongWritable, WarcRecord> s) throws Exception {
                         String exceptionMessage = "";
                         String exceptionCause = "";
                         String contentType = "";
@@ -134,106 +132,75 @@ public class WarcReader {
 
                             // Do not process html files, process.py is better at this
                             if (contentType.contains("text/html")) {
-                                return RowFactory.create(id, contentType, IOUtils.toString(s._2.getPayload().getInputStream()));
-                                //return RowFactory.create(id, contentType, handler.toString()));
+                                return new Tuple2<Text, Tuple2<Text, Text>>(new Text(contentType), new Tuple2<Text, Text>(new Text(id), new Text(IOUtils.toString(s._2.getPayload().getInputStream()))));
                             }
 
                             logger.debug("finished " + s._1);
-                            return RowFactory.create(id, contentType, handler.toString());
+                            return new Tuple2<Text, Tuple2<Text, Text>>(new Text(contentType), new Tuple2<Text, Text>(new Text(id), new Text(handler.toString())));
 
                         } catch (TikaException e) {
                             exceptionMessage = e.getMessage();
                             exceptionCause = e.getCause().toString();
-                            logger.error(e.getMessage() + " when parsing " + id + " cause " + exceptionCause);
+                            logger.debug(e.getMessage() + " when parsing " + id + " cause " + exceptionCause);
                         } catch (SAXException e) {
                             exceptionMessage = e.getMessage();
                             exceptionCause = e.getException().toString();
-                            logger.error(e.getMessage() + " when parsing " + id + " cause " + exceptionCause);
+                            logger.debug(e.getMessage() + " when parsing " + id + " cause " + exceptionCause);
                         }
 
                         // TODO what should we do with the errors?
-                        return RowFactory.create(id, "ERROR" + contentType, "ERROR: " + exceptionMessage + ":" + exceptionCause + " | " + Arrays.asList(s._2.getHeaderList()));
+                        return new Tuple2<Text, Tuple2<Text, Text>>(new Text("ERROR" + contentType), new Tuple2<Text, Text>(new Text(id), new Text("ERROR: " + exceptionMessage + ":" + exceptionCause + " | " + Arrays.asList(s._2.getHeaderList()))));
                     }
                 });
 
         // filter based on file type. Needed for testing and can be removed later on
-
         // Html and html-like files
-        JavaRDD<Row> html = records.filter(new Function<Row, Boolean>() {
-            public Boolean call(Row row) throws Exception {
-                if (row.getString(1).contains("text/html")) {
-                    return true;
-                }
-                if (row.getString(1).contains("application/xhtml+xml")) {
-                    return true;
-                }
-                if (row.getString(1).contains("application/xml")) {
-                    return true;
-                }
-                if (row.getString(1).contains("application/rss+xml")) {
-                    return true;
-                }
+        JavaPairRDD<Text, Text> html = records2.filter(new Function<Tuple2<Text, Tuple2<Text, Text>>, Boolean>() {
+            public Boolean call(Tuple2<Text, Tuple2<Text, Text>> s) throws Exception {
+                if (s._1.toString().contains("text/html"))return true;
+                if (s._1.toString().contains("application/xhtml+xml"))return true;
+                if (s._1.toString().contains("application/xml"))return true;
+                if (s._1.toString().contains("application/rss+xml"))return true;
                 return false;
+            }
+        }).mapToPair(new PairFunction<Tuple2<Text, Tuple2<Text, Text>>, Text, Text>() {
+            public Tuple2<Text, Text> call(Tuple2<Text, Tuple2<Text, Text>> s) throws Exception {
+                return s._2;
             }
         });
 
         // plaintext files, mostly robot responses or javascript code
-        JavaRDD<Row> plaintext = records.filter(new Function<Row, Boolean>() {
-            public Boolean call(Row row) throws Exception {
-                if (row.getString(1).contains("text/plain")) {
-                    return true;
-                }
+        JavaPairRDD<Text, Text> plaintext = records2.filter(new Function<Tuple2<Text, Tuple2<Text, Text>>, Boolean>() {
+            public Boolean call(Tuple2<Text, Tuple2<Text, Text>> s) throws Exception {
+                if (s._1.toString().contains("text/plain")) return true;
                 return false;
             }
+        }).mapToPair(new PairFunction<Tuple2<Text, Tuple2<Text, Text>>, Text, Text>() {
+            public Tuple2<Text, Text> call(Tuple2<Text, Tuple2<Text, Text>> s) throws Exception {
+                return s._2;
+            }
         });
 
-        // all other filetypes
+        // all other file types
         // includes pdf and word documents
-        JavaRDD<Row> others = records.filter(new Function<Row, Boolean>() {
-            public Boolean call(Row row) throws Exception {
-                if (row.getString(1).contains("text/plain")) {
-                    return false;
-                }
-                if (row.getString(1).contains("text/html")) {
-                    return false;
-                }
-                if (row.getString(1).contains("application/xhtml+xml")) {
-                    return false;
-                }
-                if (row.getString(1).contains("application/xml")) {
-                    return false;
-                }
-                if (row.getString(1).contains("application/rss+xml")) {
-                    return false;
-                }
+        JavaPairRDD<Text, Text> others = records2.filter(new Function<Tuple2<Text, Tuple2<Text, Text>>, Boolean>() {
+            public Boolean call(Tuple2<Text, Tuple2<Text, Text>> s) throws Exception {
+                if (s._1.toString().contains("text/plain"))return false;
+                if (s._1.toString().contains("text/html"))return false;
+                if (s._1.toString().contains("application/xhtml+xml"))return false;
+                if (s._1.toString().contains("application/xml"))return false;
+                if (s._1.toString().contains("application/rss+xml"))return false;
                 return true;
             }
-        });
-
-        //TODO optimise based on output type - if Hbase is not used then this is not needed
-
-        JavaPairRDD<Text, Text> htmlRDD = html.mapToPair(new PairFunction<Row, Text, Text>() {
-            public Tuple2<Text, Text> call(Row row) throws Exception {
-                return new Tuple2<Text, Text>(new Text(row.getString(0)), new Text(row.getString(2)));
+        }).mapToPair(new PairFunction<Tuple2<Text, Tuple2<Text, Text>>, Text, Text>() {
+            public Tuple2<Text, Text> call(Tuple2<Text, Tuple2<Text, Text>> s) throws Exception {
+                return s._2;
             }
         });
 
-        JavaPairRDD<Text, Text> plainTextRDD = plaintext.mapToPair(new PairFunction<Row, Text, Text>() {
-            public Tuple2<Text, Text> call(Row row) throws Exception {
-                return new Tuple2<Text, Text>(new Text(row.getString(0)), new Text(row.getString(2)));
-            }
-        });
-
-        JavaPairRDD<Text, Text> otherRDD = others.mapToPair(new PairFunction<Row, Text, Text>() {
-            public Tuple2<Text, Text> call(Row row) throws Exception {
-                return new Tuple2<Text, Text>(new Text(row.getString(0)), new Text(row.getString(2)));
-            }
-        });
-
-
-        htmlRDD.saveAsNewAPIHadoopFile(outputPath + "/html", Text.class, Text.class, org.apache.hadoop.mapreduce.lib.output.SequenceFileOutputFormat.class, hadoopconf);
-        plainTextRDD.saveAsNewAPIHadoopFile(outputPath + "/plaintext", Text.class, Text.class, org.apache.hadoop.mapreduce.lib.output.SequenceFileOutputFormat.class, hadoopconf);
-        otherRDD.saveAsNewAPIHadoopFile(outputPath + "/others", Text.class, Text.class, org.apache.hadoop.mapreduce.lib.output.SequenceFileOutputFormat.class, hadoopconf);
+        html.saveAsNewAPIHadoopFile(outputPath + "/html", Text.class, Text.class, org.apache.hadoop.mapreduce.lib.output.SequenceFileOutputFormat.class, hadoopconf);
+        plaintext.saveAsNewAPIHadoopFile(outputPath + "/plaintext", Text.class, Text.class, org.apache.hadoop.mapreduce.lib.output.SequenceFileOutputFormat.class, hadoopconf);
+        others.saveAsNewAPIHadoopFile(outputPath + "/others", Text.class, Text.class, org.apache.hadoop.mapreduce.lib.output.SequenceFileOutputFormat.class, hadoopconf);
         ///saveDF(html, sqlContext, outputPath, "html");
         //saveDF(plaintext, sqlContext, outputPath, "plaintext");
         //saveDF(others, sqlContext, outputPath, "others");
