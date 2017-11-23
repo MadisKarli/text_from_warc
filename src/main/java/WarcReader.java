@@ -53,14 +53,13 @@ public class WarcReader {
     public static void main(String[] args) throws IOException {
 
         if (args.length < 2) {
-            System.err.println("Usage: TikaReader <input folder> <output folder>");
+            System.err.println("Usage: WarcReader <input folder> <output folder>");
             System.err.println("Additional 3rd arg - if you want separate output folders for html, plaintext and others");
             throw new IOException("Wrong input arguments");
         }
 
         String inputPath = args[0];
-        // TODO remove before prod
-        String outputPath = args[1] + System.currentTimeMillis();
+        String outputPath = args[1];
 
         boolean doOutputSeparation = false;
         try {
@@ -135,22 +134,21 @@ public class WarcReader {
 
                         String id = protocol + "::" + hostname + "::" + urlpath + "::" + param + "::" + date;
 
-                        // Ignore CSS, JS, jquery files as they rarely have any meaningful text
-                        // maybe also ignore robots.txt?
-                        if (urlpath.endsWith(".css")) {
-                            return new Tuple2<Text, Tuple2<Text, Text>>(new Text("CSS"), new Tuple2<Text, Text>(new Text(id), new Text("")));
+                        // Ignore files that rarely have any meaningful text
+                        List<String> ignoreList = new ArrayList<String>();
+                        ignoreList.add(".css");
+                        ignoreList.add(".js");
+                        ignoreList.add("jquery");
+                        ignoreList.add("robots.txt");
+
+                        for(String suffix: ignoreList){
+                            if (urlpath.endsWith(suffix)) {
+                                return new Tuple2<Text, Tuple2<Text, Text>>(new Text("IGNORE"), new Tuple2<Text, Text>(new Text(id), new Text("")));
+                            }
                         }
 
-                        if (urlpath.endsWith(".js")) {
-                            return new Tuple2<Text, Tuple2<Text, Text>>(new Text("JS"), new Tuple2<Text, Text>(new Text(id), new Text("")));
-                        }
-
-                        if (urlpath.endsWith("jquery")) {
-                            return new Tuple2<Text, Tuple2<Text, Text>>(new Text("JS"), new Tuple2<Text, Text>(new Text(id), new Text("")));
-                        }
-
+                        // Extract text from Warc file
                         try {
-
                             // Have Tika itself select the parser that matches content
                             AutoDetectParser parser = new AutoDetectParser();
                             // Minus 1 sets the limit to unlimited
